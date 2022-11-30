@@ -17,14 +17,13 @@
 
 
 
-
 //////////////////////////////////////////////////////////////////////////
 // Changeable parameters, constants, macros
 //////////////////////////////////////////////////////////////////////////
 
-#define ENABLE_DEBUG_MODE				1								// Enable's the debug mode (1 - on, 0 - off)
+#define ENABLE_DEBUG_MODE				0								// Enable's the debug mode (1 - on, 0 - off) - Print out the master iterator's value to leds
 
-#define CURRENT_MICROCONTROLLER			ATMEGA64						// The current microcontroller (ATMEGA128 and ATMEGA64 are supported becouse of clock speed)
+#define CURRENT_MICROCONTROLLER			ATMEGA128						// The current microcontroller (ATMEGA128 and ATMEGA64 are supported becouse of clock speed)
 
 
 // Set the delays
@@ -49,6 +48,7 @@
 
 
 
+
 //////////////////////////////////////////////////////////////////////////
 // The Master Table
 //////////////////////////////////////////////////////////////////////////
@@ -68,7 +68,7 @@ uint8_t MasterTable[21][11] = {
 	// Data Header
 	{7,	4,											2, 2, 2, 0,		0, 4, 4, 4,		255},		// 0 - PORT				+ Service Button On
 	{7,	3,											4, 5, 6, 0,		0, 6, 7, 7,		255},		// 1 - PIN				+ Service Button Off
-	{0,	0,											1, 0, 0, 0,		2, 0, 0, 0,		255},		// 2 - TYPE / DELAY
+	{0,	0,											1, 0, 0, 0,		2, 0, 0, 20,		255},		// 2 - TYPE / DELAY
 	
 	// Train ports and pins
 	{4, 5,		4, 4,		2, 7,		7, 2,		7, 1,		255},							// 3 - TRAIN
@@ -196,7 +196,6 @@ uint8_t MasterTable[53][31] = {
 
 
 
-
 //////////////////////////////////////////////////////////////////////////
 // Mostly static constants/macros
 //////////////////////////////////////////////////////////////////////////
@@ -265,8 +264,9 @@ uint8_t MasterTable[53][31] = {
 #define DDR_Train_Button				3								// Train button's ddr ID, used to make a switch-case statement more readable
 #define DDR_Service_Button				4								// Service mode button's ddr ID, used to make a switch-case statement more readable
 
-
-
+#define BLINK_EFFECT					51								// SW PWM blinking light's alternating time (must be 255's divisor)
+#define DATA_PWM_Offset					3								// Offset in the mastertable for the light's pwm brightness
+#define DATA_Direction_Offset			2								// Offseb ub the mastertable for the sw pwm fading direction
 
 
 
@@ -319,6 +319,7 @@ void	Set_TrafficBlinkCounter(uint8_t, uint8_t);			// Sets the blink delay counte
 void	Tick_TrafficBlinkCounter(uint8_t);					// Iterates downwards the blink delay counter
 uint8_t Get_TrafficBlinkCounter(uint8_t);					// Returns the blink delay counter's current value
 
+void SwPwm();												// SW PWM's function (runs on high frequency)
 
 
 // Train
@@ -335,7 +336,6 @@ void	Set_TrainManager(uint8_t);							// Sets a bit to 1 in the train manager va
 void	Clear_TrainManager(uint8_t);						// Clears a bit to 0 in the train manager variable based on the input
 uint8_t Get_TrainManager(uint8_t);							// Returns a bit's state in the train manager variable based on the input
 uint8_t Is_TrainManager_Gone();								// Returns true or false if there are no trains on the tracks (Both left and right switches triggered)
-
 
 
 // Transition
@@ -370,10 +370,8 @@ uint8_t Get_Delay_MasterTable();							// Returns the delay from the mastertable
 uint8_t Get_Type_MasterTable(uint8_t);						// Returns the light's type from the mastertable based on the lightID
 uint8_t Get_CurrentState_MasterTable(uint8_t);				// Returns the light's current state from the mastertable, based on the current line and the lightID
 uint8_t Get_Data_MasterTable(uint8_t, uint8_t);				// Returns a data from the mastertable based on the inputs (row and coulumn)
+void Set_Data_MasterTable(uint8_t, uint8_t, uint8_t);		// Sets data to the mastertable based on the inputs (row and coulumn)
 uint8_t Is_End_MasterTable(uint8_t);						// Returns true if the current lightID is the end of the master table
-
-
-
 
 
 
@@ -411,6 +409,10 @@ uint8_t DataIterator = 0;				// Mainly used for going thru the lightIDs
 uint8_t TrafficIterator = 0;			// Used for going thru lightID's different states
 uint8_t TransitionDataIterator = 0;		// Used for going thru the lightIDs within the volatile line
 
+// Software PWM
+uint8_t SwPwmPulse = 0;					// SW PWM's counter
+uint8_t PwmIterator = 0;				// SW PWM's master table thingy (reads out the lightID)
+
 // Master control
 uint8_t CurrentDelay = 0;				// Current state's delay, it decreases downwards
 uint8_t NewData = 0;					// A flag if if new data/line needs to be read
@@ -430,7 +432,7 @@ uint8_t MasterIterator = 0;				// The current line's ID
 //////////////////////////////////////////////////////////////////////////
 
 int main(void) {
-	
+
 	PortInitialization();									// Initializes the ports
 	TimerInitialization(CURRENT_MICROCONTROLLER);			// Initializes the timers
 	Start_NewProgram(PROGRAM_Normal_All_Red);				// Starts the light's program
@@ -448,6 +450,7 @@ int main(void) {
 // Timer1's interrupt, exactly 100ms
 //////////////////////////////////////////////////////////////////////////
 ISR(TIMER1_COMPA_vect) {
+	sei();													// Enable the interupts so SW PWM can do its job
 	
 	// New Data Controler
 	if (NewData) {											// Of the NewData flag is set
@@ -479,6 +482,7 @@ ISR(TIMER1_COMPA_vect) {
 // Timer0's interrupt for the buttons, around ~16-33ms (based on the micro-controller)
 //////////////////////////////////////////////////////////////////////////
 ISR(TIMER0_OVF_vect) {
+	sei();													// Enable the interupts so SW PWM can do its job
 	
 	// Runs the button controller
 	Controller_Button();
@@ -486,6 +490,13 @@ ISR(TIMER0_OVF_vect) {
 
 
 
+//////////////////////////////////////////////////////////////////////////
+// Timer2's interrupt for the SW PWM (High frequency)
+//////////////////////////////////////////////////////////////////////////
+ISR(TIMER2_COMP_vect) {
+	// Runs the SW PWM function (High frequency)
+	SwPwm();
+}
 
 
 
@@ -591,20 +602,36 @@ void Controller_TrafficCarLight() {
 // Pedestrian traffic light controller
 //////////////////////////////////////////////////////////////////////////
 void Controller_TrafficPedestrianLight() {
+	uint8_t breathEffect = 0;
+	
 	Set_TrafficLight_MasterTable(DataIterator + DATA_Pedestrian_Red_Offset);							// Set's the red pedestrianlight corresponding to the master table's state 
 	
 	if (Get_Port_Traffic(DataIterator + DATA_Pedestrian_Green_Offset)) {								// Checks if the light's port can be found in the master table
 		if (Get_CurrentState_MasterTable(DataIterator + DATA_Pedestrian_Green_Offset)) {				// If the light's current state is green in the master table
-			Set_State_Traffic(STATE_ON, DataIterator + DATA_Pedestrian_Green_Offset);					//   It sets it to green
+			Set_TrafficBlinkCounter(255, DataIterator + DATA_Pedestrian_Blink_Offset);					// It sets it to green
+		
 		} else if (Get_CurrentState_MasterTable(DataIterator + DATA_Pedestrian_Blink_Offset)) {			// If the light's current state is blinking in the master table
-			if (Get_TrafficBlinkCounter(DataIterator + DATA_Pedestrian_Blink_Offset) <= 1) {			//   It checks if the light's counter reached the end
-				Set_TrafficBlinkCounter(DELAY_Blink, DataIterator + DATA_Pedestrian_Blink_Offset);		//     Reset's the light's counter based on the DELAY_Blink definition
-				Set_State_Traffic(STATE_BLINK, DataIterator + DATA_Pedestrian_Blink_Offset);			//     It switches the light to the opposite state
-			} else {																					//   If the light's counter haven't reached the end
-				Tick_TrafficBlinkCounter(DataIterator + DATA_Pedestrian_Blink_Offset);					//     Iterates the light's counter downwards
+			
+			breathEffect = Get_TrafficBlinkCounter(DataIterator + DATA_PWM_Offset);
+			
+			if (breathEffect <= 1) {																	// If we reached the lowest value
+				Set_TrafficBlinkCounter(1, DataIterator + DATA_Direction_Offset);						//   Set it to the other direction
+				breathEffect = 0;																		//   Reset the breath effect
+			} else if (breathEffect == 255) {															// If we reached the highest value
+				Set_TrafficBlinkCounter(0, DataIterator + DATA_Direction_Offset);						//   Set it to the other direction
 			}
+			
+			if (Get_TrafficBlinkCounter(DataIterator + DATA_Direction_Offset)) {						// If the direction is true
+				breathEffect += BLINK_EFFECT;															//   Iterate the brightness upward
+			} else {
+				breathEffect -= BLINK_EFFECT;															//   Iterate the brightness downward
+			}
+
+			Set_TrafficBlinkCounter(breathEffect, DataIterator + DATA_PWM_Offset);						// Sets the pedestrian light's brightness
+			
 		} else {																						// If its neither on or blinking
-			Set_State_Traffic(STATE_OFF, DataIterator + DATA_Pedestrian_Blink_Offset);					//   It turns of the light
+			Set_State_Traffic(STATE_OFF, DataIterator + DATA_Pedestrian_Blink_Offset);					//   It turns off the light
+			Set_TrafficBlinkCounter(0, DataIterator + DATA_PWM_Offset);									// Turns off the light
 		}
 	}
 }
@@ -765,6 +792,45 @@ void TransitionState() {
 //////////////////////////////////////////////////////////////////////////
 // Button controller
 //////////////////////////////////////////////////////////////////////////
+void SwPwm() {	
+	
+	SwPwmPulse++;
+	if (SwPwmPulse == 0) {
+		SwPwmPulse = 1;
+	}
+	
+	PwmIterator = DATA_Traffic_Light_StartID;
+	
+	while(1) {
+		
+		if (Get_Type_MasterTable(PwmIterator) == TYPE_PedestrianLight) {
+			if (Get_TrafficBlinkCounter(PwmIterator + DATA_PWM_Offset) > SwPwmPulse) {
+				Set_State_Traffic(STATE_ON, PwmIterator + DATA_Pedestrian_Blink_Offset);
+			} else {
+				Set_State_Traffic(STATE_OFF, PwmIterator + DATA_Pedestrian_Blink_Offset);
+			}
+		}
+		
+
+		PwmIterator += DATA_Traffic_Light_NextID;			// Goes to the next light's id
+
+		if (Is_End_MasterTable(PwmIterator)) {				// If it reached the end of the mastertable it breaks from the loop
+			break;
+		}
+	}
+}
+
+
+
+
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////
+// Button controller
+//////////////////////////////////////////////////////////////////////////
 
 // Controls the button inputs
 void Controller_Button() {
@@ -862,7 +928,12 @@ void TimerInitialization(uint8_t clock_speed){
 		
 		// TIMER 0 OVFLW 256 ~61Hz - ~16ms
 		TCCR0 = (0<<WGM01) | (0<<WGM00) | (1<<CS02) | (1<<CS01) | (1<<CS00);
-		TIMSK |= (0<<OCIE0) | (1 << TOIE0);
+		TIMSK |= (0 << OCIE0) | (1 << TOIE0);
+		
+		// TIMER 2 CTC - Very high freqvency
+		TCCR2 = (1<<WGM21) | (0<<WGM20) | (0<<CS22) | (1<<CS21) | (0<<CS20);
+		TIMSK |= (1 << OCIE2) | (0 << TOIE2);
+		OCR2 = 150;
 		
 	// If the micro-controller has a 8 MHz clock
 	} else if (clock_speed == 8) {
@@ -873,8 +944,13 @@ void TimerInitialization(uint8_t clock_speed){
 		OCR1A = 3125-1;
 		
 		// TIMER 0 OVFLW 256 ~30Hz - ~33ms
-		TCCR0 = (0<<WGM01) | (0<<WGM00) | (1<<CS02) | (1<<CS01) | (1<<CS00);
+		TCCR0 = (0<<WGM01) | (0<<WGM00) | (1<<CS02) | (1<<CS01) | (0<<CS00);
 		TIMSK |= (0<<OCIE0) | (1 << TOIE0);
+		
+		// TIMER 2 CTC - Very high freqvency (IT MIGHT BE TOO MUCH FOR THE 8MHZ CLOCK)
+		TCCR2 = (1<<WGM21) | (0<<WGM20) | (0<<CS22) | (1<<CS21) | (0<<CS20);
+		TIMSK |= (1 << OCIE2) | (0 << TOIE2);
+		OCR2 = 150;
 	}
 	
 	// Enable Interrupts
@@ -1013,6 +1089,11 @@ void DebugMode() {
 // Returns the data from the master table corresponding to the parameters
 uint8_t Get_Data_MasterTable(uint8_t line, uint8_t id) {
 	return MasterTable[line][id];
+}
+
+// Sets data to the master table
+void Set_Data_MasterTable(uint8_t data, uint8_t line, uint8_t id) {
+	MasterTable[line][id] = data;
 }
 
 // Returns the next program addres from the current line
